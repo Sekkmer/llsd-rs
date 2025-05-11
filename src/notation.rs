@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn real() {
-        round_trip_default(Llsd::Real(3.1415));
+        round_trip_default(Llsd::Real(13.1415));
     }
 
     #[test]
@@ -796,7 +796,7 @@ mod tests {
     fn map() {
         let mut map = HashMap::new();
         map.insert("answer".into(), Llsd::Integer(42));
-        map.insert("pi".into(), Llsd::Real(3.14));
+        map.insert("pi".into(), Llsd::Real(13.14));
         map.insert("greeting".into(), Llsd::String("hello".into()));
         round_trip_default(Llsd::Map(map.clone()));
         round_trip(Llsd::Map(map), FormatterContext::new().with_pretty(true));
