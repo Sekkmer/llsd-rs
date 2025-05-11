@@ -5,6 +5,7 @@ edition = "2024"
 license = "LGPL-2.1"
 authors = ["Sekkmer"]
 readme = "README.md"
+description = "A Rust library for parsing and serializing LLSD (Linden Lab Structured Data) format."
 
 [dependencies]
 anyhow = "1.0.98"
