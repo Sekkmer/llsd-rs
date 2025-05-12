@@ -8,7 +8,7 @@ A native Rust implementation of Linden Lab’s LLSD (Linden Lab Structured Data)
   - Undefined, Boolean, Integer, Real, String
   - URI, UUID, Date, Binary
   - Array and Map structures
-- Support for LLSD **Binary**, **XML**, **National**, and **XML-RPC** serialization
+- Support for LLSD **Binary**, **XML**, **Notation**, and **XML-RPC** serialization
 - Zero-copy & allocation-minimal where possible
 - Inspired by and compatible with the Second Life viewer’s LLSD codebase
 
