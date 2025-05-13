@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{Bytes, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     vec,
 };
 
@@ -440,25 +440,26 @@ pub fn to_string(llsd: &Llsd, context: &FormatterContext) -> Result<String, anyh
     String::from_utf8(buffer).map_err(anyhow::Error::msg)
 }
 
-pub fn from_reader<R: Read>(reader: &mut R, max_depth: usize) -> Result<Llsd, anyhow::Error> {
-    let Some(c) = next_not_whitespace(reader)? else {
+pub fn from_reader<R: Read>(reader: R, max_depth: usize) -> Result<Llsd, anyhow::Error> {
+    let mut stream = Stream::new(reader);
+    let Some(c) = stream.skip_ws()? else {
         return Ok(Llsd::Undefined);
     };
-    from_reader_char(reader, c, max_depth)
+    from_reader_char(&mut stream, c, max_depth)
 }
 
 pub fn from_str(s: &str, max_depth: usize) -> Result<Llsd, anyhow::Error> {
-    let mut reader = s.as_bytes();
-    from_reader(&mut reader, max_depth)
+    let reader = s.as_bytes();
+    from_reader(reader, max_depth)
 }
 
 pub fn from_bytes(bytes: &[u8], max_depth: usize) -> Result<Llsd, anyhow::Error> {
-    let mut reader = bytes;
-    from_reader(&mut reader, max_depth)
+    let reader = bytes;
+    from_reader(reader, max_depth)
 }
 
 fn from_reader_char<R: Read>(
-    reader: &mut R,
+    stream: &mut Stream<R>,
     char: u8,
     max_depth: usize,
 ) -> Result<Llsd, anyhow::Error> {
@@ -469,12 +470,12 @@ fn from_reader_char<R: Read>(
         b'{' => {
             let mut map = HashMap::new();
             loop {
-                match next_not_whitespace(reader)? {
+                match stream.skip_ws()? {
                     Some(b'}') => break,
                     Some(b',') => continue,
                     Some(quote @ (b'\'' | b'"')) => {
-                        let key = unescape(reader, quote)?;
-                        match next_not_whitespace(reader)? {
+                        let key = stream.unescape(quote)?;
+                        match stream.skip_ws()? {
                             Some(b':') => {}
                             Some(other) => {
                                 return Err(anyhow::Error::msg(format!(
@@ -484,7 +485,7 @@ fn from_reader_char<R: Read>(
                             }
                             None => return Err(anyhow::Error::msg("Unexpected end of input")),
                         }
-                        let value_first = match next_not_whitespace(reader)? {
+                        let value_first = match stream.skip_ws()? {
                             Some(c) => c,
                             None => {
                                 return Err(anyhow::Error::msg(
@@ -492,7 +493,7 @@ fn from_reader_char<R: Read>(
                                 ));
                             }
                         };
-                        map.insert(key, from_reader_char(reader, value_first, max_depth + 1)?);
+                        map.insert(key, from_reader_char(stream, value_first, max_depth + 1)?);
                     }
                     Some(other) => {
                         return Err(anyhow::Error::msg(format!(
@@ -508,10 +509,10 @@ fn from_reader_char<R: Read>(
         b'[' => {
             let mut array = vec![];
             loop {
-                match next_not_whitespace(reader)? {
+                match stream.skip_ws()? {
                     Some(b']') => break,
                     Some(b',') => continue,
-                    Some(c) => array.push(from_reader_char(reader, c, max_depth + 1)?),
+                    Some(c) => array.push(from_reader_char(stream, c, max_depth + 1)?),
                     None => return Err(anyhow::Error::msg("Unexpected end of input")),
                 }
             }
@@ -521,81 +522,62 @@ fn from_reader_char<R: Read>(
         b'0' => Ok(Llsd::Boolean(false)),
         b'1' => Ok(Llsd::Boolean(true)),
         b'i' | b'I' => {
-            let mut i = 0;
-            let mut first = true;
-            let iter = reader.bytes();
-            for c in iter {
-                let c = c?;
-                match c {
-                    b'0'..=b'9' => i = i * 10 + (c - b'0') as i32,
-                    b'-' if first => i = -i,
-                    b'+' if first => {}
-                    _ => break,
+            let sign = match stream.peek()? {
+                Some(b'-') => {
+                    stream.next()?;
+                    -1
                 }
-                first = false;
-            }
-            Ok(Llsd::Integer(i))
+                Some(b'+') => {
+                    stream.next()?;
+                    1
+                }
+                _ => 1,
+            };
+            let buf = stream.take_while(|c| matches!(c, b'0'..=b'9' | b'-'))?;
+            let i = String::from_utf8(buf)?.parse::<i32>()?;
+            Ok(Llsd::Integer(i * sign))
         }
         b'r' | b'R' => {
-            let mut buf = vec![];
-            let iter = reader.bytes();
-            for c in iter {
-                let c = c?;
-                match c {
-                    b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E' => buf.push(c),
-                    _ => break,
-                }
-            }
-            let s = String::from_utf8(buf)?;
-            let f = s.parse::<f64>()?;
+            let buf = stream
+                .take_while(|c| matches!(c, b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E'))?;
+            let f = String::from_utf8(buf)?.parse::<f64>()?;
             Ok(Llsd::Real(f))
         }
         b'u' | b'U' => {
-            let mut buf = vec![];
-            let iter = reader.bytes();
-            for c in iter {
-                let c = c?;
-                match c {
-                    b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'-' => buf.push(c),
-                    _ => break,
-                }
-            }
-            let s = String::from_utf8(buf)?;
-            let uuid = Uuid::parse_str(s.as_str())?;
+            let buf = stream
+                .take_while(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'-'))?;
+            let uuid = Uuid::parse_str(String::from_utf8(buf)?.as_str())?;
             Ok(Llsd::Uuid(uuid))
         }
         b't' | b'T' => {
-            expect(reader, b"rR")?;
-            expect(reader, b"uU")?;
-            expect(reader, b"eE")?;
+            stream.expect(b"rR")?;
+            stream.expect(b"uU")?;
+            stream.expect(b"eE")?;
             Ok(Llsd::Boolean(true))
         }
         b'f' | b'F' => {
-            expect(reader, b"aA")?;
-            expect(reader, b"lL")?;
-            expect(reader, b"sS")?;
-            expect(reader, b"eE")?;
+            stream.expect(b"aA")?;
+            stream.expect(b"lL")?;
+            stream.expect(b"sS")?;
+            stream.expect(b"eE")?;
             Ok(Llsd::Boolean(false))
         }
-        b'\'' => Ok(Llsd::String(unescape(reader, b'\'')?)),
-        b'"' => Ok(Llsd::String(unescape(reader, b'"')?)),
+        b'\'' => Ok(Llsd::String(stream.unescape(b'\'')?)),
+        b'"' => Ok(Llsd::String(stream.unescape(b'"')?)),
         b'l' | b'L' => {
-            expect(reader, b"\"")?;
-            Ok(Llsd::Uri(Uri::parse(&unescape(reader, b'"')?)))
+            stream.expect(b"\"")?;
+            Ok(Llsd::Uri(Uri::parse(&stream.unescape(b'"')?)))
         }
         b'd' | b'D' => {
-            expect(reader, b"\"")?;
-            let str = unescape(reader, b'"')?;
+            stream.expect(b"\"")?;
+            let str = stream.unescape(b'"')?;
             Ok(Llsd::Date(DateTime::parse_from_rfc3339(&str)?.into()))
         }
         b'b' | b'B' => {
-            if let Some(c) = reader.bytes().next() {
-                let c = c?;
+            if let Some(c) = stream.next()? {
                 if c == b'(' {
                     let mut buf = vec![];
-                    let iter = reader.bytes();
-                    for c in iter {
-                        let c = c?;
+                    while let Some(c) = stream.next()? {
                         match c {
                             b'0'..=b'9' => buf.push(c),
                             b')' => break,
@@ -603,22 +585,20 @@ fn from_reader_char<R: Read>(
                         }
                     }
                     let len = String::from_utf8(buf)?.parse::<usize>()?;
-                    expect(reader, b"\"")?;
+                    stream.expect(b"\"")?;
                     let mut buf = vec![0; len];
-                    reader.read_exact(&mut buf)?;
-                    expect(reader, b"\"")?;
+                    stream.read_exact(&mut buf)?;
+                    stream.expect(b"\"")?;
                     Ok(Llsd::Binary(buf))
                 } else if c == b'1' {
-                    expect(reader, b"6")?;
-                    expect(reader, b"\"")?;
+                    stream.expect(b"6")?;
+                    stream.expect(b"\"")?;
                     let mut buf = vec![];
-                    let mut iter = reader.bytes();
-                    while let Some(c) = iter.next() {
-                        let c = c?;
+                    while let Some(c) = stream.next()? {
                         match c {
-                            b'0'..=b'9' => buf.push(((c - b'0') << 4) | hex(&mut iter)?),
-                            b'a'..=b'f' => buf.push(((c - b'a' + 10) << 4) | hex(&mut iter)?),
-                            b'A'..=b'F' => buf.push(((c - b'A' + 10) << 4) | hex(&mut iter)?),
+                            b'0'..=b'9' => buf.push(((c - b'0') << 4) | stream.hex()?),
+                            b'a'..=b'f' => buf.push(((c - b'a' + 10) << 4) | stream.hex()?),
+                            b'A'..=b'F' => buf.push(((c - b'A' + 10) << 4) | stream.hex()?),
                             b'"' => break,
                             _ => return Err(anyhow::Error::msg("Invalid binary format")),
                         }
@@ -638,77 +618,125 @@ fn from_reader_char<R: Read>(
     }
 }
 
-fn next_not_whitespace<R: Read>(reader: &mut R) -> Result<Option<u8>, anyhow::Error> {
-    let iter = reader.bytes();
-    for c in iter {
-        match c? {
-            b' ' | b'\t' | b'\n' | b'\r' => continue,
-            c => return Ok(Some(c)),
-        }
-    }
-    Ok(None)
+struct Stream<R: Read> {
+    inner: BufReader<R>,
 }
 
-fn expect<R: Read>(reader: &mut R, expected: &[u8]) -> Result<(), anyhow::Error> {
-    if let Some(c) = reader.bytes().next() {
-        let c = c?;
-        if !expected.contains(&c) {
-            return Err(anyhow::Error::msg(format!(
-                "Expected one of {:?}, found {}",
-                expected, c
-            )));
+impl<R: Read> Stream<R> {
+    fn new(read: R) -> Self {
+        Self {
+            inner: BufReader::new(read),
         }
     }
-    Ok(())
-}
+    /// Return the next byte **without** consuming it.
+    fn peek(&mut self) -> io::Result<Option<u8>> {
+        Ok(self.inner.fill_buf()?.first().copied())
+    }
 
-fn unescape<R: Read>(reader: &mut R, delim: u8) -> Result<String, anyhow::Error> {
-    let mut buf = Vec::new();
-    let mut iter = reader.bytes();
-    loop {
-        match iter.next() {
-            Some(Ok(c)) if c == delim => break,
-            Some(Ok(b'\\')) => match iter.next() {
-                Some(Ok(c)) => match c {
-                    b'a' => buf.push(0x07),
-                    b'b' => buf.push(0x08),
-                    b'f' => buf.push(0x0c),
-                    b'n' => buf.push(b'\n'),
-                    b'r' => buf.push(b'\r'),
-                    b't' => buf.push(b'\t'),
-                    b'v' => buf.push(0x0b),
-                    b'\\' => buf.push(b'\\'),
-                    b'\'' => buf.push(b'\''),
-                    b'"' => buf.push(b'"'),
-                    b'x' => {
-                        let high = hex(&mut iter)?;
-                        let low = hex(&mut iter)?;
-                        buf.push((high << 4) | low);
-                    }
-                    other => buf.push(other),
+    /// Consume one byte and return it.
+    fn next(&mut self) -> io::Result<Option<u8>> {
+        let byte = match self.peek()? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        self.inner.consume(1);
+        Ok(Some(byte))
+    }
+
+    /// Skip ASCII whitespace and return the first non-WS byte, consuming it
+    fn skip_ws(&mut self) -> io::Result<Option<u8>> {
+        loop {
+            match self.peek()? {
+                Some(b' ' | b'\t' | b'\r' | b'\n') => {
+                    self.inner.consume(1);
+                }
+                other => {
+                    self.inner.consume(1);
+                    return Ok(other);
+                }
+            }
+        }
+    }
+
+    /// Consume one of the expected bytes.
+    fn expect(&mut self, expected: &[u8]) -> anyhow::Result<()> {
+        match self.next()? {
+            Some(b) if expected.contains(&b) => Ok(()),
+            Some(b) => Err(anyhow::anyhow!(
+                "expected one of {:?}, found 0x{:02x}",
+                expected,
+                b
+            )),
+            None => Err(anyhow::anyhow!("unexpected end of input")),
+        }
+    }
+
+    /// Read a sequence that satisfies `pred` (stop *before* the first byte
+    /// that fails the predicate).
+    fn take_while<F>(&mut self, mut pred: F) -> anyhow::Result<Vec<u8>>
+    where
+        F: FnMut(u8) -> bool,
+    {
+        let mut out = Vec::new();
+        while let Some(b) = self.peek()? {
+            if pred(b) {
+                self.inner.consume(1);
+                out.push(b);
+            } else {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Unescape a string until the delimiter is reached.
+    fn unescape(&mut self, delim: u8) -> anyhow::Result<String> {
+        let mut buf = Vec::new();
+        loop {
+            match self.next()? {
+                Some(c) if c == delim => break,
+                Some(b'\\') => match self.next()? {
+                    Some(c) => match c {
+                        b'a' => buf.push(0x07),
+                        b'b' => buf.push(0x08),
+                        b'f' => buf.push(0x0c),
+                        b'n' => buf.push(b'\n'),
+                        b'r' => buf.push(b'\r'),
+                        b't' => buf.push(b'\t'),
+                        b'v' => buf.push(0x0b),
+                        b'\\' => buf.push(b'\\'),
+                        b'\'' => buf.push(b'\''),
+                        b'"' => buf.push(b'"'),
+                        b'x' => {
+                            let high = self.hex()?;
+                            let low = self.hex()?;
+                            buf.push((high << 4) | low);
+                        }
+                        other => buf.push(other),
+                    },
+                    None => return Err(anyhow::Error::msg("Unexpected end of input")),
                 },
-                Some(Err(e)) => return Err(e.into()),
+                Some(other) => buf.push(other),
                 None => return Err(anyhow::Error::msg("Unexpected end of input")),
-            },
-            Some(Ok(other)) => buf.push(other),
-            Some(Err(e)) => return Err(e.into()),
-            None => return Err(anyhow::Error::msg("Unexpected end of input")),
+            }
+        }
+        Ok(String::from_utf8(buf)?)
+    }
+
+    /// Read a hex character and return its value.
+    fn hex(&mut self) -> anyhow::Result<u8> {
+        let c = self.next()?;
+        match c {
+            Some(b'0'..=b'9') => Ok(c.unwrap() - b'0'),
+            Some(b'a'..=b'f') => Ok(c.unwrap() - b'a' + 10),
+            Some(b'A'..=b'F') => Ok(c.unwrap() - b'A' + 10),
+            _ => Err(anyhow::Error::msg("Invalid hex character")),
         }
     }
-    Ok(String::from_utf8(buf)?)
-}
 
-fn hex<R: Read>(reader: &mut Bytes<R>) -> Result<u8, anyhow::Error> {
-    let c = reader.next();
-    match c {
-        Some(Ok(c)) => match c {
-            b'0'..=b'9' => Ok(c - b'0'),
-            b'a'..=b'f' => Ok(c - b'a' + 10),
-            b'A'..=b'F' => Ok(c - b'A' + 10),
-            _ => Err(anyhow::Error::msg("Invalid hex character")),
-        },
-        Some(Err(e)) => Err(e.into()),
-        None => Err(anyhow::Error::msg("Unexpected end of input")),
+    /// Read exactly `n` bytes into the buffer.
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read_exact(buf)
     }
 }
 
