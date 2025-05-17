@@ -5,6 +5,7 @@ use std::{
 };
 
 use chrono::DateTime;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{Llsd, Uri};
@@ -329,7 +330,7 @@ const STRING_CHARACTERS: [&[u8]; 256] = [
     b"\\xff", // 255
 ];
 
-fn write_string<W: Write>(s: &str, w: &mut W) -> Result<(), anyhow::Error> {
+fn write_string<W: Write>(s: &str, w: &mut W) -> Result<(), io::Error> {
     for c in s.bytes() {
         w.write_all(STRING_CHARACTERS[c as usize])?;
     }
@@ -340,7 +341,7 @@ fn write_inner<W: Write>(
     llsd: &Llsd,
     w: &mut W,
     context: &FormatterContext,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), io::Error> {
     let (indent, newline) = context.indent();
     match llsd {
         Llsd::Map(v) => {
@@ -425,22 +426,22 @@ pub fn write<W: Write>(
     llsd: &Llsd,
     w: &mut W,
     context: &FormatterContext,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), io::Error> {
     write_inner(llsd, w, context)
 }
 
-pub fn to_vec(llsd: &Llsd, context: &FormatterContext) -> Result<Vec<u8>, anyhow::Error> {
+pub fn to_vec(llsd: &Llsd, context: &FormatterContext) -> Result<Vec<u8>, io::Error> {
     let mut buffer = Vec::new();
     write(llsd, &mut buffer, context)?;
     Ok(buffer)
 }
 
-pub fn to_string(llsd: &Llsd, context: &FormatterContext) -> Result<String, anyhow::Error> {
+pub fn to_string(llsd: &Llsd, context: &FormatterContext) -> Result<String, io::Error> {
     let buffer = to_vec(llsd, context)?;
-    String::from_utf8(buffer).map_err(anyhow::Error::msg)
+    String::from_utf8(buffer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-pub fn from_reader<R: Read>(reader: R, max_depth: usize) -> Result<Llsd, anyhow::Error> {
+pub fn from_reader<R: Read>(reader: R, max_depth: usize) -> ParseResult<Llsd> {
     let mut stream = Stream::new(reader);
     let Some(c) = stream.skip_ws()? else {
         return Ok(Llsd::Undefined);
@@ -448,23 +449,39 @@ pub fn from_reader<R: Read>(reader: R, max_depth: usize) -> Result<Llsd, anyhow:
     from_reader_char(&mut stream, c, max_depth)
 }
 
-pub fn from_str(s: &str, max_depth: usize) -> Result<Llsd, anyhow::Error> {
+pub fn from_str(s: &str, max_depth: usize) -> ParseResult<Llsd> {
     let reader = s.as_bytes();
     from_reader(reader, max_depth)
 }
 
-pub fn from_bytes(bytes: &[u8], max_depth: usize) -> Result<Llsd, anyhow::Error> {
+pub fn from_bytes(bytes: &[u8], max_depth: usize) -> ParseResult<Llsd> {
     let reader = bytes;
     from_reader(reader, max_depth)
+}
+
+macro_rules! bail {
+    ($stream:expr, $kind:expr $(,)?) => {{
+        let pos = $stream.pos();
+        return Err(ParseError { kind: $kind, pos });
+    }};
+}
+
+macro_rules! map {
+    ($stream:expr, $value:expr) => {{
+        match $value {
+            Ok(v) => Ok(v),
+            Err(e) => bail!($stream, e.into()),
+        }
+    }};
 }
 
 fn from_reader_char<R: Read>(
     stream: &mut Stream<R>,
     char: u8,
     max_depth: usize,
-) -> Result<Llsd, anyhow::Error> {
+) -> ParseResult<Llsd> {
     if max_depth == 0 {
-        return Err(anyhow::Error::msg("Max depth reached"));
+        bail!(stream, ParseErrorKind::MaxDepth);
     }
     match char {
         b'{' => {
@@ -473,35 +490,44 @@ fn from_reader_char<R: Read>(
                 match stream.skip_ws()? {
                     Some(b'}') => break,
                     Some(b',') => continue,
-                    Some(quote @ (b'\'' | b'"')) => {
-                        let key = stream.unescape(quote)?;
+                    Some(quote @ (b'\'' | b'"' | b's')) => {
+                        let key = if quote == b's' {
+                            let buf = stream.read_sized()?;
+                            stream.parse_utf8(buf)?
+                        } else {
+                            stream.unescape(quote)?
+                        };
                         match stream.skip_ws()? {
                             Some(b':') => {}
                             Some(other) => {
-                                return Err(anyhow::Error::msg(format!(
-                                    "Expected ':', found byte 0x{:02x}",
-                                    other
-                                )));
+                                bail!(
+                                    stream,
+                                    ParseErrorKind::Expected(format!(
+                                        "':' or '}}' after key, found: 0x{:02x}",
+                                        other
+                                    ))
+                                );
                             }
-                            None => return Err(anyhow::Error::msg("Unexpected end of input")),
+                            None => bail!(stream, ParseErrorKind::Eof),
                         }
                         let value_first = match stream.skip_ws()? {
                             Some(c) => c,
                             None => {
-                                return Err(anyhow::Error::msg(
-                                    "Unexpected end of input after ':'",
-                                ));
+                                bail!(stream, ParseErrorKind::Eof);
                             }
                         };
                         map.insert(key, from_reader_char(stream, value_first, max_depth + 1)?);
                     }
                     Some(other) => {
-                        return Err(anyhow::Error::msg(format!(
-                            "Invalid character in map: 0x{:02x}",
-                            other
-                        )));
+                        bail!(
+                            stream,
+                            ParseErrorKind::Expected(format!(
+                                "Invalid character in map: 0x{:02x}",
+                                other
+                            ))
+                        );
                     }
-                    None => return Err(anyhow::Error::msg("Unexpected end of input")),
+                    None => bail!(stream, ParseErrorKind::Eof),
                 }
             }
             Ok(Llsd::Map(map))
@@ -513,7 +539,7 @@ fn from_reader_char<R: Read>(
                     Some(b']') => break,
                     Some(b',') => continue,
                     Some(c) => array.push(from_reader_char(stream, c, max_depth + 1)?),
-                    None => return Err(anyhow::Error::msg("Unexpected end of input")),
+                    None => bail!(stream, ParseErrorKind::Eof),
                 }
             }
             Ok(Llsd::Array(array))
@@ -534,19 +560,18 @@ fn from_reader_char<R: Read>(
                 _ => 1,
             };
             let buf = stream.take_while(|c| matches!(c, b'0'..=b'9' | b'-'))?;
-            let i = String::from_utf8(buf)?.parse::<i32>()?;
+            let i = map!(stream, stream.parse_utf8(buf)?.parse::<i32>())?;
             Ok(Llsd::Integer(i * sign))
         }
         b'r' | b'R' => {
-            let buf = stream
-                .take_while(|c| matches!(c, b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E'))?;
-            let f = String::from_utf8(buf)?.parse::<f64>()?;
+            let buf = stream.take_while(|c| b"-.0123456789eEinfINFaA".contains(&c))?;
+            let f = map!(stream, stream.parse_utf8(buf)?.parse::<f64>())?;
             Ok(Llsd::Real(f))
         }
         b'u' | b'U' => {
             let buf = stream
                 .take_while(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' | b'-'))?;
-            let uuid = Uuid::parse_str(String::from_utf8(buf)?.as_str())?;
+            let uuid = map!(stream, Uuid::parse_str(stream.parse_utf8(buf)?.as_str()))?;
             Ok(Llsd::Uuid(uuid))
         }
         b't' | b'T' => {
@@ -564,6 +589,11 @@ fn from_reader_char<R: Read>(
         }
         b'\'' => Ok(Llsd::String(stream.unescape(b'\'')?)),
         b'"' => Ok(Llsd::String(stream.unescape(b'"')?)),
+        b's' => {
+            let buf = stream.read_sized()?;
+            let str = stream.parse_utf8(buf)?;
+            Ok(Llsd::String(str))
+        }
         b'l' | b'L' => {
             stream.expect(b"\"")?;
             Ok(Llsd::Uri(Uri::parse(&stream.unescape(b'"')?)))
@@ -571,26 +601,15 @@ fn from_reader_char<R: Read>(
         b'd' | b'D' => {
             stream.expect(b"\"")?;
             let str = stream.unescape(b'"')?;
-            Ok(Llsd::Date(DateTime::parse_from_rfc3339(&str)?.into()))
+            let time = map!(stream, DateTime::parse_from_rfc3339(&str))?;
+            Ok(Llsd::Date(time.into()))
         }
         b'b' | b'B' => {
-            if let Some(c) = stream.next()? {
+            if let Some(c) = stream.peek()? {
                 if c == b'(' {
-                    let mut buf = vec![];
-                    while let Some(c) = stream.next()? {
-                        match c {
-                            b'0'..=b'9' => buf.push(c),
-                            b')' => break,
-                            _ => return Err(anyhow::Error::msg("Invalid binary format")),
-                        }
-                    }
-                    let len = String::from_utf8(buf)?.parse::<usize>()?;
-                    stream.expect(b"\"")?;
-                    let mut buf = vec![0; len];
-                    stream.read_exact(&mut buf)?;
-                    stream.expect(b"\"")?;
-                    Ok(Llsd::Binary(buf))
+                    Ok(Llsd::Binary(stream.read_sized()?))
                 } else if c == b'1' {
+                    stream.next()?;
                     stream.expect(b"6")?;
                     stream.expect(b"\"")?;
                     let mut buf = vec![];
@@ -600,80 +619,195 @@ fn from_reader_char<R: Read>(
                             b'a'..=b'f' => buf.push(((c - b'a' + 10) << 4) | stream.hex()?),
                             b'A'..=b'F' => buf.push(((c - b'A' + 10) << 4) | stream.hex()?),
                             b'"' => break,
-                            _ => return Err(anyhow::Error::msg("Invalid binary format")),
+                            _ => bail!(
+                                stream,
+                                ParseErrorKind::Expected(format!(
+                                    "expected digit or ')', found: 0x{:02x}",
+                                    c
+                                ))
+                            ),
                         }
                     }
                     Ok(Llsd::Binary(buf))
                 } else {
-                    Err(anyhow::Error::msg("Invalid binary format"))
+                    bail!(
+                        stream,
+                        ParseErrorKind::Expected("Invalid binary format".to_string())
+                    );
                 }
             } else {
-                Err(anyhow::Error::msg("Unexpected end of input"))
+                bail!(stream, ParseErrorKind::Eof);
             }
         }
-        c => Err(anyhow::Error::msg(format!(
-            "Invalid character: 0x{:02x}",
-            c
-        ))),
+        c => bail!(
+            stream,
+            ParseErrorKind::Expected(format!("Invalid character: 0x{:02x}", c))
+        ),
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub offset: usize,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ParseErrorKind {
+    #[error("max recursion depth reached")]
+    MaxDepth,
+    #[error("unexpected end of input")]
+    Eof,
+    #[error("invalid character: 0x{0:02x}")]
+    InvalidChar(u8),
+    #[error("expected {0}")]
+    Expected(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("utf8 error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error("uuid error: {0}")]
+    Uuid(#[from] uuid::Error),
+    #[error("chrono error: {0}")]
+    Chrono(#[from] chrono::ParseError),
+    #[error("int error: {0}")]
+    Int(#[from] std::num::ParseIntError),
+    #[error("float error: {0}")]
+    Float(#[from] std::num::ParseFloatError),
+}
+
+impl PartialEq for ParseErrorKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ParseErrorKind::MaxDepth, ParseErrorKind::MaxDepth) => true,
+            (ParseErrorKind::Eof, ParseErrorKind::Eof) => true,
+            (ParseErrorKind::InvalidChar(a), ParseErrorKind::InvalidChar(b)) => a == b,
+            (ParseErrorKind::Expected(a), ParseErrorKind::Expected(b)) => a == b,
+            (ParseErrorKind::Io(a), ParseErrorKind::Io(b)) => {
+                a.kind() == b.kind() && a.to_string() == b.to_string()
+            }
+            (ParseErrorKind::Utf8(a), ParseErrorKind::Utf8(b)) => a.to_string() == b.to_string(),
+            (ParseErrorKind::Uuid(a), ParseErrorKind::Uuid(b)) => a.to_string() == b.to_string(),
+            (ParseErrorKind::Chrono(a), ParseErrorKind::Chrono(b)) => {
+                a.to_string() == b.to_string()
+            }
+            (ParseErrorKind::Int(a), ParseErrorKind::Int(b)) => a.to_string() == b.to_string(),
+            (ParseErrorKind::Float(a), ParseErrorKind::Float(b)) => a.to_string() == b.to_string(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ParseErrorKind {}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("{kind} at byte {} (line {}, col {})", pos.offset, pos.line, pos.column)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub pos: Position,
+}
+
+type ParseResult<T> = Result<T, ParseError>;
+
 struct Stream<R: Read> {
     inner: BufReader<R>,
+    pos: Position,
 }
 
 impl<R: Read> Stream<R> {
     fn new(read: R) -> Self {
         Self {
             inner: BufReader::new(read),
+            pos: Position::default(),
         }
     }
+
+    #[inline]
+    pub fn pos(&self) -> Position {
+        self.pos
+    }
+
+    #[inline]
+    fn advance(&mut self, byte: u8) {
+        self.pos.offset += 1;
+        if byte == b'\n' {
+            self.pos.line += 1;
+            self.pos.column = 1;
+        } else {
+            self.pos.column += 1;
+        }
+    }
+
     /// Return the next byte **without** consuming it.
-    fn peek(&mut self) -> io::Result<Option<u8>> {
-        Ok(self.inner.fill_buf()?.first().copied())
+    fn peek(&mut self) -> ParseResult<Option<u8>> {
+        match self.inner.fill_buf() {
+            Ok([]) => Ok(None),
+            Ok(buf) => {
+                let byte = buf[0];
+                self.pos.offset += 1;
+                self.pos.column += 1;
+                Ok(Some(byte))
+            }
+            Err(e) => Err(ParseError {
+                kind: ParseErrorKind::Io(e),
+                pos: self.pos,
+            }),
+        }
     }
 
     /// Consume one byte and return it.
-    fn next(&mut self) -> io::Result<Option<u8>> {
-        let byte = match self.peek()? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        self.inner.consume(1);
-        Ok(Some(byte))
+    fn next(&mut self) -> ParseResult<Option<u8>> {
+        if let Some(b) = self.peek()? {
+            self.advance(b);
+            self.inner.consume(1);
+            return Ok(Some(b));
+        }
+        Ok(None)
     }
 
     /// Skip ASCII whitespace and return the first non-WS byte, consuming it
-    fn skip_ws(&mut self) -> io::Result<Option<u8>> {
+    fn skip_ws(&mut self) -> ParseResult<Option<u8>> {
         loop {
-            match self.peek()? {
-                Some(b' ' | b'\t' | b'\r' | b'\n') => {
-                    self.inner.consume(1);
-                }
-                other => {
-                    self.inner.consume(1);
-                    return Ok(other);
-                }
+            match self.next()? {
+                Some(b' ' | b'\t' | b'\r' | b'\n') => continue,
+                Some(b) => return Ok(Some(b)),
+                None => return Ok(None),
             }
         }
     }
 
     /// Consume one of the expected bytes.
-    fn expect(&mut self, expected: &[u8]) -> anyhow::Result<()> {
+    fn expect(&mut self, expected: &[u8]) -> ParseResult<()> {
         match self.next()? {
             Some(b) if expected.contains(&b) => Ok(()),
-            Some(b) => Err(anyhow::anyhow!(
-                "expected one of {:?}, found 0x{:02x}",
-                expected,
-                b
-            )),
-            None => Err(anyhow::anyhow!("unexpected end of input")),
+            Some(b) => Err(ParseError {
+                kind: ParseErrorKind::Expected(format!(
+                    "expected one of {:?}, found: 0x{:02x}",
+                    expected, b
+                )),
+                pos: self.pos,
+            }),
+            None => Err(ParseError {
+                kind: ParseErrorKind::Eof,
+                pos: self.pos,
+            }),
         }
     }
 
     /// Read a sequence that satisfies `pred` (stop *before* the first byte
     /// that fails the predicate).
-    fn take_while<F>(&mut self, mut pred: F) -> anyhow::Result<Vec<u8>>
+    fn take_while<F>(&mut self, mut pred: F) -> ParseResult<Vec<u8>>
     where
         F: FnMut(u8) -> bool,
     {
@@ -681,6 +815,7 @@ impl<R: Read> Stream<R> {
         while let Some(b) = self.peek()? {
             if pred(b) {
                 self.inner.consume(1);
+                self.advance(b);
                 out.push(b);
             } else {
                 break;
@@ -690,7 +825,7 @@ impl<R: Read> Stream<R> {
     }
 
     /// Unescape a string until the delimiter is reached.
-    fn unescape(&mut self, delim: u8) -> anyhow::Result<String> {
+    fn unescape(&mut self, delim: u8) -> ParseResult<String> {
         let mut buf = Vec::new();
         loop {
             match self.next()? {
@@ -714,29 +849,60 @@ impl<R: Read> Stream<R> {
                         }
                         other => buf.push(other),
                     },
-                    None => return Err(anyhow::Error::msg("Unexpected end of input")),
+                    None => bail!(self, ParseErrorKind::Eof),
                 },
                 Some(other) => buf.push(other),
-                None => return Err(anyhow::Error::msg("Unexpected end of input")),
+                None => bail!(self, ParseErrorKind::Eof),
             }
         }
-        Ok(String::from_utf8(buf)?)
+        self.parse_utf8(buf)
     }
 
     /// Read a hex character and return its value.
-    fn hex(&mut self) -> anyhow::Result<u8> {
+    fn hex(&mut self) -> ParseResult<u8> {
         let c = self.next()?;
         match c {
             Some(b'0'..=b'9') => Ok(c.unwrap() - b'0'),
             Some(b'a'..=b'f') => Ok(c.unwrap() - b'a' + 10),
             Some(b'A'..=b'F') => Ok(c.unwrap() - b'A' + 10),
-            _ => Err(anyhow::Error::msg("Invalid hex character")),
+            _ => bail!(self, ParseErrorKind::InvalidChar(c.unwrap_or(0))),
         }
     }
 
     /// Read exactly `n` bytes into the buffer.
-    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.inner.read_exact(buf)
+    fn read_exact(&mut self, buf: &mut [u8]) -> ParseResult<()> {
+        match self.inner.read_exact(buf) {
+            Err(e) => Err(ParseError {
+                kind: ParseErrorKind::Io(e),
+                pos: self.pos,
+            }),
+            _ => {
+                self.pos.offset += buf.len();
+                self.pos.line += buf.iter().filter(|&&b| b == b'\n').count();
+                self.pos.column = buf.iter().rev().take_while(|&&b| b != b'\n').count();
+                Ok(())
+            }
+        }
+    }
+
+    fn read_sized(&mut self) -> ParseResult<Vec<u8>> {
+        self.expect(b"(")?;
+        let buf = self.take_while(|c| c != b')')?;
+        self.expect(b")")?;
+        let size = map!(self, self.parse_utf8(buf)?.parse::<usize>())?;
+        self.expect(b"\"'")?;
+        let mut buf = vec![0; size];
+        self.read_exact(&mut buf)?;
+        self.expect(b"\"'")?;
+        Ok(buf)
+    }
+
+    /// Read a UTF-8 string from the buffer.
+    pub fn parse_utf8(&self, buf: Vec<u8>) -> ParseResult<String> {
+        String::from_utf8(buf).map_err(|e| ParseError {
+            kind: ParseErrorKind::Utf8(e),
+            pos: self.pos,
+        })
     }
 }
 
