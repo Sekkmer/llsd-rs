@@ -7,6 +7,7 @@ authors = ["Sekkmer"]
 readme = "README.md"
 description = "A Rust library for parsing and serializing LLSD (Linden Lab Structured Data) format."
 repository = "https://github.com/Sekkmer/llsd-rs"
+keywords = ["secondlife", "parser"]
 
 [dependencies]
 anyhow = "1.0.98"
