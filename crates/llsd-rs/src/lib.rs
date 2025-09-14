@@ -7,9 +7,13 @@ use url::Url;
 use uuid::Uuid;
 
 pub mod binary;
+pub mod derive;
 pub mod notation;
 pub mod rpc;
 pub mod xml;
+
+#[cfg(feature = "derive")]
+pub use llsd_rs_derive::{LlsdFrom, LlsdFromTo, LlsdInto};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum Uri {
@@ -239,14 +243,35 @@ impl From<bool> for Llsd {
     }
 }
 
+impl From<&bool> for Llsd {
+    fn from(v: &bool) -> Self {
+        Llsd::Boolean(*v)
+    }
+}
+
 macro_rules! impl_from_int {
-	($($t:ty),*) => {
-		$(
-			impl From<$t> for Llsd {
-				fn from(llsd: $t) -> Self {
-					Llsd::Integer(llsd as i32)
-				}
-			}
+    ($($t:ty),*) => {
+            $(
+            impl From<$t> for Llsd {
+                fn from(llsd: $t) -> Self {
+                    Llsd::Integer(llsd as i32)
+                }
+            }
+            impl TryFrom<&Llsd> for $t {
+                type Error = anyhow::Error;
+
+                fn try_from(llsd: &Llsd) -> Result<Self> {
+                    match llsd {
+                        Llsd::Integer(value) => Ok(*value as $t),
+                        Llsd::Real(value) => Ok(*value as $t),
+                        Llsd::Boolean(value) => Ok(if *value { 1 } else { 0 } as $t),
+                        Llsd::String(value) => {
+                            value.parse::<$t>().map_err(|_| anyhow::Error::msg("Invalid integer"))
+                        }
+                        _ => Err(anyhow::Error::msg("Expected LLSD Integer")),
+                    }
+                }
+            }
 		)*
 	};
 }
@@ -261,6 +286,26 @@ macro_rules! impl_from_real {
                     Llsd::Real(llsd as f64)
                 }
             }
+            impl From<&$t> for Llsd {
+                fn from(llsd: &$t) -> Self {
+                    Llsd::Real(*llsd as f64)
+                }
+            }
+            impl TryFrom<&Llsd> for $t {
+                type Error = anyhow::Error;
+
+                fn try_from(llsd: &Llsd) -> Result<Self> {
+                    match llsd {
+                        Llsd::Real(value) => Ok(*value as $t),
+                        Llsd::Integer(value) => Ok(*value as $t),
+                        Llsd::Boolean(value) => Ok(if *value { 1.0 } else { 0.0 } as $t),
+                        Llsd::String(value) => {
+                            value.parse::<$t>().map_err(|_| anyhow::Error::msg("Invalid real"))
+                        }
+                        _ => Err(anyhow::Error::msg("Expected LLSD Real")),
+                    }
+                }
+            }
         )*
     };
 }
@@ -273,9 +318,27 @@ impl From<&str> for Llsd {
     }
 }
 
+impl From<String> for Llsd {
+    fn from(llsd: String) -> Self {
+        Llsd::String(llsd)
+    }
+}
+
+impl From<&String> for Llsd {
+    fn from(v: &String) -> Self {
+        Llsd::String(v.clone())
+    }
+}
+
 impl From<Uuid> for Llsd {
     fn from(llsd: Uuid) -> Self {
         Llsd::Uuid(llsd)
+    }
+}
+
+impl From<&Uuid> for Llsd {
+    fn from(v: &Uuid) -> Self {
+        Llsd::Uuid(*v)
     }
 }
 
@@ -285,15 +348,33 @@ impl From<Url> for Llsd {
     }
 }
 
+impl From<&Url> for Llsd {
+    fn from(v: &Url) -> Self {
+        Llsd::Uri(v.clone().into())
+    }
+}
+
 impl From<DateTime<Utc>> for Llsd {
     fn from(llsd: DateTime<Utc>) -> Self {
         Llsd::Date(llsd)
     }
 }
 
+impl From<&DateTime<Utc>> for Llsd {
+    fn from(v: &DateTime<Utc>) -> Self {
+        Llsd::Date(*v)
+    }
+}
+
 impl From<DateTime<FixedOffset>> for Llsd {
     fn from(llsd: DateTime<FixedOffset>) -> Self {
         Llsd::Date(llsd.with_timezone(&Utc))
+    }
+}
+
+impl From<&DateTime<FixedOffset>> for Llsd {
+    fn from(v: &DateTime<FixedOffset>) -> Self {
+        Llsd::Date(v.with_timezone(&Utc))
     }
 }
 
@@ -325,9 +406,91 @@ impl<K: Into<String>, V: Into<Llsd>> From<HashMap<K, V>> for Llsd {
     }
 }
 
-impl<T: Into<Llsd>> FromIterator<T> for Llsd {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Llsd::Array(iter.into_iter().map(Into::into).collect())
+// Tuple support (2..=4) explicit implementations -------------------------------------------
+impl<A: Into<Llsd>, B: Into<Llsd>> From<(A, B)> for Llsd {
+    fn from(t: (A, B)) -> Self {
+        let (a, b) = t;
+        Llsd::Array(vec![a.into(), b.into()])
+    }
+}
+impl<A, B> TryFrom<&Llsd> for (A, B)
+where
+    for<'x> A: TryFrom<&'x Llsd, Error = anyhow::Error>,
+    for<'x> B: TryFrom<&'x Llsd, Error = anyhow::Error>,
+{
+    type Error = anyhow::Error;
+    fn try_from(v: &Llsd) -> Result<Self> {
+        if let Llsd::Array(a) = v {
+            if a.len() == 2 {
+                Ok((A::try_from(&a[0])?, B::try_from(&a[1])?))
+            } else {
+                Err(anyhow::Error::msg("Expected array of length 2"))
+            }
+        } else {
+            Err(anyhow::Error::msg("Expected LLSD Array"))
+        }
+    }
+}
+
+impl<A: Into<Llsd>, B: Into<Llsd>, C: Into<Llsd>> From<(A, B, C)> for Llsd {
+    fn from(t: (A, B, C)) -> Self {
+        let (a, b, c) = t;
+        Llsd::Array(vec![a.into(), b.into(), c.into()])
+    }
+}
+impl<A, B, C> TryFrom<&Llsd> for (A, B, C)
+where
+    for<'x> A: TryFrom<&'x Llsd, Error = anyhow::Error>,
+    for<'x> B: TryFrom<&'x Llsd, Error = anyhow::Error>,
+    for<'x> C: TryFrom<&'x Llsd, Error = anyhow::Error>,
+{
+    type Error = anyhow::Error;
+    fn try_from(v: &Llsd) -> Result<Self> {
+        if let Llsd::Array(a) = v {
+            if a.len() == 3 {
+                Ok((
+                    A::try_from(&a[0])?,
+                    B::try_from(&a[1])?,
+                    C::try_from(&a[2])?,
+                ))
+            } else {
+                Err(anyhow::Error::msg("Expected array of length 3"))
+            }
+        } else {
+            Err(anyhow::Error::msg("Expected LLSD Array"))
+        }
+    }
+}
+
+impl<A: Into<Llsd>, B: Into<Llsd>, C: Into<Llsd>, D: Into<Llsd>> From<(A, B, C, D)> for Llsd {
+    fn from(t: (A, B, C, D)) -> Self {
+        let (a, b, c, d) = t;
+        Llsd::Array(vec![a.into(), b.into(), c.into(), d.into()])
+    }
+}
+impl<A, B, C, D> TryFrom<&Llsd> for (A, B, C, D)
+where
+    for<'x> A: TryFrom<&'x Llsd, Error = anyhow::Error>,
+    for<'x> B: TryFrom<&'x Llsd, Error = anyhow::Error>,
+    for<'x> C: TryFrom<&'x Llsd, Error = anyhow::Error>,
+    for<'x> D: TryFrom<&'x Llsd, Error = anyhow::Error>,
+{
+    type Error = anyhow::Error;
+    fn try_from(v: &Llsd) -> Result<Self> {
+        if let Llsd::Array(a) = v {
+            if a.len() == 4 {
+                Ok((
+                    A::try_from(&a[0])?,
+                    B::try_from(&a[1])?,
+                    C::try_from(&a[2])?,
+                    D::try_from(&a[3])?,
+                ))
+            } else {
+                Err(anyhow::Error::msg("Expected array of length 4"))
+            }
+        } else {
+            Err(anyhow::Error::msg("Expected LLSD Array"))
+        }
     }
 }
 
@@ -476,5 +639,61 @@ where
 {
     fn index_mut(&mut self, index: I) -> &mut Llsd {
         index.index_or_insert(self)
+    }
+}
+
+impl TryFrom<&Llsd> for bool {
+    type Error = anyhow::Error;
+
+    fn try_from(llsd: &Llsd) -> anyhow::Result<Self> {
+        if let Some(value) = llsd.as_boolean() {
+            Ok(*value)
+        } else {
+            Err(anyhow::Error::msg("Expected LLSD Boolean"))
+        }
+    }
+}
+
+impl TryFrom<&Llsd> for String {
+    type Error = anyhow::Error;
+
+    fn try_from(llsd: &Llsd) -> anyhow::Result<Self> {
+        if let Some(value) = llsd.as_string() {
+            Ok(value.clone())
+        } else {
+            Err(anyhow::Error::msg("Expected LLSD String"))
+        }
+    }
+}
+
+impl<T> TryFrom<&Llsd> for Vec<T>
+where
+    T: for<'a> TryFrom<&'a Llsd, Error = anyhow::Error>,
+{
+    type Error = anyhow::Error;
+
+    fn try_from(llsd: &Llsd) -> anyhow::Result<Self> {
+        if let Some(array) = llsd.as_array() {
+            array.iter().map(|item| T::try_from(item)).collect()
+        } else {
+            Err(anyhow::Error::msg("Expected LLSD Array"))
+        }
+    }
+}
+
+impl<V> TryFrom<&Llsd> for HashMap<String, V>
+where
+    V: for<'a> TryFrom<&'a Llsd, Error = anyhow::Error>,
+{
+    type Error = anyhow::Error;
+
+    fn try_from(llsd: &Llsd) -> anyhow::Result<Self> {
+        if let Some(map) = llsd.as_map() {
+            map.iter()
+                .map(|(k, v)| Ok((k.clone(), V::try_from(v)?)))
+                .collect()
+        } else {
+            Err(anyhow::Error::msg("Expected LLSD Map"))
+        }
     }
 }

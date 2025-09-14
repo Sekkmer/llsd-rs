@@ -1,0 +1,26 @@
+[package]
+name = "llsd-rs"
+version = "0.1.4"
+edition = { workspace = true }
+license = "LGPL-2.1"
+authors = ["Sekkmer"]
+readme = "README.md"
+description = "A Rust library for parsing and serializing LLSD (Linden Lab Structured Data) format."
+repository = "https://github.com/Sekkmer/llsd-rs"
+keywords = ["secondlife", "parser"]
+
+[features]
+default = []
+derive = ["llsd-rs-derive"]
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+binrw = { workspace = true }
+chrono = { workspace = true }
+enum-as-inner = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+xml-rs = { workspace = true }
+llsd-rs-derive = { version = "0.1", path = "../llsd-rs-derive", optional = true }

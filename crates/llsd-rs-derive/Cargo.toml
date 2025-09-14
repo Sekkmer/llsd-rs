@@ -1,0 +1,20 @@
+[package]
+name = "llsd-rs-derive"
+version = "0.1.1"
+edition = { workspace = true }
+authors = ["Sekkmer"]
+description = "Proc-macro derives for llsd-rs (LlsdFrom, LlsdInto, LlsdFromTo)."
+license = "LGPL-2.1"
+repository = "https://github.com/Sekkmer/llsd-rs"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+llsd-rs = { version = "0.1", path = "../llsd-rs", features = ["derive"] }
