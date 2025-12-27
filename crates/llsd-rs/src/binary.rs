@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -203,8 +203,33 @@ pub fn from_reader_inner<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
     }
 }
 
+fn looks_like_llsd_binary_header(header: &[u8]) -> bool {
+    header
+        .windows(b"LLSD/Binary".len())
+        .any(|w| w == b"LLSD/Binary")
+}
+
 pub fn from_reader<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
-    from_reader_inner(r)
+    let mut reader = BufReader::new(r);
+    {
+        let buf = reader.fill_buf()?;
+        if matches!(buf.first(), Some(b'<')) {
+            let mut header = Vec::new();
+            reader.read_until(b'>', &mut header)?;
+            if looks_like_llsd_binary_header(&header) {
+                loop {
+                    let next = reader.fill_buf()?;
+                    match next.first() {
+                        Some(b' ' | b'\r' | b'\n' | b'\t') => reader.consume(1),
+                        _ => break,
+                    }
+                }
+            } else {
+                return Err(anyhow::anyhow!("Unexpected LLSD binary header"));
+            }
+        }
+    }
+    from_reader_inner(&mut reader)
 }
 
 pub fn from_slice(data: &[u8]) -> Result<Llsd, anyhow::Error> {
@@ -293,6 +318,16 @@ mod tests {
         let encoded = to_vec(&Llsd::Map(map.clone())).expect("encode failed");
         let decoded = from_slice(&encoded).expect("decode failed");
         assert_eq!(decoded, Llsd::Map(map));
+    }
+
+    #[test]
+    fn binary_header_prefix_is_skipped() {
+        let value = Llsd::String("hello".to_string());
+        let mut encoded = b"<? LLSD/Binary ?>\n".to_vec();
+        encoded.extend(to_vec(&value).expect("encode failed"));
+
+        let decoded = from_slice(&encoded).expect("decode failed");
+        assert_eq!(decoded, value);
     }
 
     #[test]
