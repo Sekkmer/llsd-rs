@@ -173,6 +173,9 @@ pub fn from_reader_inner<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
             for _ in 0..len {
                 buf.push(from_reader_inner(r)?);
             }
+            if read_u8(r)? != b']' {
+                return Err(anyhow::anyhow!("Expected ']'"));
+            }
             Ok(Llsd::Array(buf))
         }
         b'{' => {
@@ -276,6 +279,20 @@ mod tests {
             Llsd::Boolean(false),
         ];
         round_trip(Llsd::Array(arr));
+    }
+
+    #[test]
+    fn array_in_map_parses_closing_bracket() {
+        let mut map = HashMap::new();
+        map.insert(
+            "a".to_string(),
+            Llsd::Array(vec![Llsd::Integer(1), Llsd::Integer(2)]),
+        );
+        map.insert("b".to_string(), Llsd::String("ok".to_string()));
+
+        let encoded = to_vec(&Llsd::Map(map.clone())).expect("encode failed");
+        let decoded = from_slice(&encoded).expect("decode failed");
+        assert_eq!(decoded, Llsd::Map(map));
     }
 
     #[test]
