@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -126,8 +126,8 @@ fn unescape<R: Read>(r: &mut R, delim: u8) -> Result<String, anyhow::Error> {
     Ok(String::from_utf8(buf)?)
 }
 
-pub fn from_reader_inner<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
-    match read_u8(r)? {
+fn from_reader_inner_with_tag<R: Read>(r: &mut R, tag: u8) -> Result<Llsd, anyhow::Error> {
+    match tag {
         b'!' => Ok(Llsd::Undefined),
         b'1' => Ok(Llsd::Boolean(true)),
         b'0' => Ok(Llsd::Boolean(false)),
@@ -203,33 +203,56 @@ pub fn from_reader_inner<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
     }
 }
 
+pub fn from_reader_inner<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
+    let tag = read_u8(r)?;
+    from_reader_inner_with_tag(r, tag)
+}
+
 fn looks_like_llsd_binary_header(header: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"LLSD/Binary";
     header
-        .windows(b"LLSD/Binary".len())
-        .any(|w| w == b"LLSD/Binary")
+        .windows(NEEDLE.len())
+        .any(|w| w.eq_ignore_ascii_case(NEEDLE))
 }
 
 pub fn from_reader<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
-    let mut reader = BufReader::new(r);
-    {
-        let buf = reader.fill_buf()?;
-        if matches!(buf.first(), Some(b'<')) {
-            let mut header = Vec::new();
-            reader.read_until(b'>', &mut header)?;
-            if looks_like_llsd_binary_header(&header) {
-                loop {
-                    let next = reader.fill_buf()?;
-                    match next.first() {
-                        Some(b' ' | b'\r' | b'\n' | b'\t') => reader.consume(1),
-                        _ => break,
-                    }
-                }
-            } else {
-                return Err(anyhow::anyhow!("Unexpected LLSD binary header"));
-            }
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first)?;
+    if first[0] != b'<' {
+        return from_reader_inner_with_tag(r, first[0]);
+    }
+
+    let mut header = vec![first[0]];
+    let mut buf = [0u8; 1];
+    let mut found_end = false;
+    for _ in 0..128 {
+        r.read_exact(&mut buf)?;
+        header.push(buf[0]);
+        if buf[0] == b'>' {
+            found_end = true;
+            break;
         }
     }
-    from_reader_inner(&mut reader)
+
+    if !found_end || !looks_like_llsd_binary_header(&header) {
+        return Err(anyhow::anyhow!("Unexpected LLSD header"));
+    }
+
+    // consume optional whitespace after header, then parse next tag
+    loop {
+        let mut next = [0u8; 1];
+        match r.read(&mut next) {
+            Ok(0) => return Err(anyhow::anyhow!("Unexpected EOF after LLSD header")),
+            Ok(1) => {
+                if matches!(next[0], b' ' | b'\r' | b'\n' | b'\t') {
+                    continue;
+                }
+                return from_reader_inner_with_tag(r, next[0]);
+            }
+            Ok(_) => unreachable!(),
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 pub fn from_slice(data: &[u8]) -> Result<Llsd, anyhow::Error> {
@@ -328,6 +351,34 @@ mod tests {
 
         let decoded = from_slice(&encoded).expect("decode failed");
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn binary_header_is_case_insensitive() {
+        let value = Llsd::String("hello".to_string());
+        let mut encoded = b"<? llsd/binary ?>\n".to_vec();
+        encoded.extend(to_vec(&value).expect("encode failed"));
+
+        let decoded = from_slice(&encoded).expect("decode failed");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn from_reader_preserves_trailing_bytes() {
+        let mut map = HashMap::new();
+        map.insert("answer".into(), Llsd::Integer(42));
+        let value = Llsd::Map(map);
+        let mut encoded = b"<? LLSD/Binary ?>\n".to_vec();
+        encoded.extend(to_vec(&value).expect("encode failed"));
+        encoded.extend(b"TAIL");
+
+        let mut cursor = std::io::Cursor::new(encoded);
+        let decoded = from_reader(&mut cursor).expect("decode failed");
+        assert_eq!(decoded, value);
+
+        let pos = cursor.position() as usize;
+        let buf = cursor.get_ref();
+        assert_eq!(&buf[pos..], b"TAIL");
     }
 
     #[test]
