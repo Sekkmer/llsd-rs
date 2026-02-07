@@ -83,6 +83,18 @@ enum Expected {
     Param,
 }
 
+#[inline]
+#[cfg(feature = "opensim")]
+fn is_xmlrpc_int_tag(tag: &str) -> bool {
+    matches!(tag, "int" | "i4" | "i")
+}
+
+#[inline]
+#[cfg(not(feature = "opensim"))]
+fn is_xmlrpc_int_tag(tag: &str) -> bool {
+    matches!(tag, "int")
+}
+
 pub fn from_parser<R: std::io::Read>(parser: EventReader<R>) -> Result<XmlRpc, anyhow::Error> {
     use xml::reader::XmlEvent;
     let mut stack: Vec<Llsd> = Vec::new();
@@ -111,7 +123,7 @@ pub fn from_parser<R: std::io::Read>(parser: EventReader<R>) -> Result<XmlRpc, a
                     (Expected::None, "nil") => stack.push(Llsd::Undefined),
                     (Expected::None, "boolean") => stack.push(Llsd::Boolean(false)),
                     (Expected::None, "string") => stack.push(Llsd::String(String::new())),
-                    (Expected::None, "int") => stack.push(Llsd::Integer(0)),
+                    (Expected::None, tag) if is_xmlrpc_int_tag(tag) => stack.push(Llsd::Integer(0)),
                     (Expected::None, "double") => stack.push(Llsd::Real(0.0)),
                     (Expected::None, "dateTime.iso8601") => {
                         stack.push(Llsd::Date(Default::default()))
@@ -389,6 +401,40 @@ mod tests {
     #[test]
     fn integer() {
         round_trip(Llsd::Integer(42));
+    }
+
+    #[cfg(feature = "opensim")]
+    #[test]
+    fn parses_opensim_int_alias_tags() {
+        let xml_i4 = r#"
+<methodResponse><params><param><value><i4>7</i4></value></param></params></methodResponse>
+"#;
+        let xml_i = r#"
+<methodResponse><params><param><value><i>9</i></value></param></params></methodResponse>
+"#;
+        let parsed_i4 = from_str(xml_i4).expect("i4 should parse");
+        let parsed_i = from_str(xml_i).expect("i should parse");
+        assert_eq!(parsed_i4.llsd(), &Llsd::Integer(7));
+        assert_eq!(parsed_i.llsd(), &Llsd::Integer(9));
+    }
+
+    #[cfg(not(feature = "opensim"))]
+    #[test]
+    fn rejects_opensim_int_alias_tags_without_feature() {
+        let xml_i4 = r#"
+<methodResponse><params><param><value><i4>7</i4></value></param></params></methodResponse>
+"#;
+        let xml_i = r#"
+<methodResponse><params><param><value><i>9</i></value></param></params></methodResponse>
+"#;
+        assert!(
+            from_str(xml_i4).is_err(),
+            "i4 should not parse without opensim"
+        );
+        assert!(
+            from_str(xml_i).is_err(),
+            "i should not parse without opensim"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ keywords = ["secondlife", "parser"]
 [features]
 default = []
 derive = ["llsd-rs-derive"]
+opensim = []
 
 [dependencies]
 anyhow = { workspace = true }
