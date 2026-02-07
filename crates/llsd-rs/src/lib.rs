@@ -6,6 +6,7 @@ use enum_as_inner::EnumAsInner;
 use url::Url;
 use uuid::Uuid;
 
+pub mod autodetect;
 pub mod binary;
 pub mod derive;
 pub mod notation;
