@@ -172,7 +172,9 @@ pub fn from_parser<R: std::io::Read>(parser: EventReader<R>) -> Result<XmlRpc, a
                         &mut Llsd::Binary(ref mut b) => {
                             *b = BASE64_STANDARD.decode(data.as_bytes())?
                         }
-                        &mut Llsd::Integer(ref mut i) => *i = data.parse()?,
+                        &mut Llsd::Integer(ref mut i) => {
+                            *i = crate::parse_i32_decimal_wrapping(data)?
+                        }
                         &mut Llsd::Real(ref mut r) => match data {
                             "nan" => *r = f64::NAN,
                             "inf" => *r = f64::INFINITY,
@@ -401,6 +403,24 @@ mod tests {
     #[test]
     fn integer() {
         round_trip(Llsd::Integer(42));
+    }
+
+    #[test]
+    fn integer_overflow_wraps_like_sscanf() {
+        let cases = [
+            ("2147483648", i32::MIN),
+            ("4294967295", -1),
+            ("4294967296", 0),
+            ("4294967297", 1),
+            ("-2147483649", i32::MAX),
+        ];
+        for (raw, expected) in cases {
+            let xml = format!(
+                "<methodResponse><params><param><value><int>{raw}</int></value></param></params></methodResponse>"
+            );
+            let parsed = from_str(&xml).expect("integer should decode");
+            assert_eq!(parsed.llsd(), &Llsd::Integer(expected), "raw={raw}");
+        }
     }
 
     #[cfg(feature = "opensim")]

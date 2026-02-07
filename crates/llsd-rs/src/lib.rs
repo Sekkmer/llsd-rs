@@ -15,6 +15,47 @@ pub mod xml;
 #[cfg(feature = "derive")]
 pub use llsd_rs_derive::{LlsdFrom, LlsdFromTo, LlsdInto};
 
+pub(crate) fn parse_i32_decimal_wrapping(input: &str) -> Result<i32> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("Invalid integer"));
+    }
+
+    let bytes = trimmed.as_bytes();
+    let (negative, digits) = match bytes[0] {
+        b'+' => (false, &bytes[1..]),
+        b'-' => (true, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() {
+        return Err(anyhow::anyhow!("Invalid integer"));
+    }
+
+    let mut acc: u32 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return Err(anyhow::anyhow!("Invalid integer"));
+        }
+        acc = acc.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+    }
+
+    if negative {
+        acc = (0u32).wrapping_sub(acc);
+    }
+    Ok(acc as i32)
+}
+
+fn coerce_string_to_i32(input: &str) -> i32 {
+    if let Ok(v) = parse_i32_decimal_wrapping(input) {
+        return v;
+    }
+    let trimmed = input.trim_start();
+    match trimmed.parse::<f64>() {
+        Ok(v) if v.is_finite() => v as i32,
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum Uri {
     #[default]
@@ -265,9 +306,7 @@ macro_rules! impl_from_int {
                         Llsd::Integer(value) => Ok(*value as $t),
                         Llsd::Real(value) => Ok(*value as $t),
                         Llsd::Boolean(value) => Ok(if *value { 1 } else { 0 } as $t),
-                        Llsd::String(value) => {
-                            value.parse::<$t>().map_err(|_| anyhow::Error::msg("Invalid integer"))
-                        }
+                        Llsd::String(value) => Ok(coerce_string_to_i32(value) as $t),
                         _ => Err(anyhow::Error::msg("Expected LLSD Integer")),
                     }
                 }
@@ -663,6 +702,28 @@ impl TryFrom<&Llsd> for String {
         } else {
             Err(anyhow::Error::msg("Expected LLSD String"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Llsd;
+
+    #[test]
+    fn string_to_integer_try_from_coerces_like_viewer() {
+        assert_eq!(i32::try_from(&Llsd::String("1.23".to_string())).unwrap(), 1);
+        assert_eq!(
+            i32::try_from(&Llsd::String("4294967296".to_string())).unwrap(),
+            0
+        );
+        assert_eq!(
+            u32::try_from(&Llsd::String("-1".to_string())).unwrap(),
+            u32::MAX
+        );
+        assert_eq!(
+            i32::try_from(&Llsd::String("not-a-number".to_string())).unwrap(),
+            0
+        );
     }
 }
 

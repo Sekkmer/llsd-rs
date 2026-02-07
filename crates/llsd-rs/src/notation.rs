@@ -548,20 +548,9 @@ fn from_reader_char<R: Read>(
         b'0' => Ok(Llsd::Boolean(false)),
         b'1' => Ok(Llsd::Boolean(true)),
         b'i' | b'I' => {
-            let sign = match stream.peek()? {
-                Some(b'-') => {
-                    stream.next()?;
-                    -1
-                }
-                Some(b'+') => {
-                    stream.next()?;
-                    1
-                }
-                _ => 1,
-            };
-            let buf = stream.take_while(|c| matches!(c, b'0'..=b'9' | b'-'))?;
+            let buf = stream.take_while(|c| matches!(c, b'0'..=b'9' | b'+' | b'-'))?;
             let i = map!(stream, stream.parse_utf8(buf)?.parse::<i32>())?;
-            Ok(Llsd::Integer(i * sign))
+            Ok(Llsd::Integer(i))
         }
         b'r' | b'R' => {
             let buf = stream.take_while(|c| b"-.0123456789eEinfINFaA".contains(&c))?;
@@ -936,6 +925,20 @@ mod tests {
     #[test]
     fn integer() {
         round_trip_default(Llsd::Integer(42));
+    }
+
+    #[test]
+    fn integer_notation_accepts_i32_min() {
+        let parsed = from_str("i-2147483648", 1).expect("i32 min should parse");
+        assert_eq!(parsed, Llsd::Integer(i32::MIN));
+    }
+
+    #[test]
+    fn integer_notation_rejects_overflow() {
+        assert!(
+            from_str("i4294967295", 1).is_err(),
+            "notation overflow should fail"
+        );
     }
 
     #[test]
