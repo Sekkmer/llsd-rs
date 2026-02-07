@@ -1,6 +1,6 @@
 [package]
 name = "llsd-rs-derive"
-version = "0.1.1"
+version = "0.1.2"
 edition = { workspace = true }
 authors = ["Sekkmer"]
 description = "Proc-macro derives for llsd-rs (LlsdFrom, LlsdInto, LlsdFromTo)."
