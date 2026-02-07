@@ -323,9 +323,9 @@ fn gen_from(
                 }
                 DefaultType::Default => {
                     if let Some(p) = with_path {
-                        quote! { map.get(#key).map(|v| #p::deserialize(v)).transpose()?.or_else(|| Some(::core::default::Default::default())) }
+                        quote! { map.get(#key).map(|v| #p::deserialize(v)).transpose()? }
                     } else {
-                        quote! { map.get(#key).map(|v| ::core::convert::TryFrom::try_from(v)).transpose()?.or_else(|| Some(::core::default::Default::default())) }
+                        quote! { map.get(#key).map(|v| ::core::convert::TryFrom::try_from(v)).transpose()? }
                     }
                 }
                 DefaultType::Path(func) => {

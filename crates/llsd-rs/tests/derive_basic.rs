@@ -20,6 +20,14 @@ fn simple_round_trip() {
     assert_eq!(s, back);
 }
 
+#[test]
+fn option_default_missing_field_stays_none() {
+    let l = Llsd::map().insert("id", 7u32).unwrap();
+    let parsed: Simple = Simple::try_from(&l).unwrap();
+    assert_eq!(parsed.id, 7);
+    assert_eq!(parsed.name, None);
+}
+
 #[derive(Debug, Clone, PartialEq, LlsdFromTo)]
 #[llsd(rename_all = "camelCase", deny_unknown_fields)]
 struct Collections {
