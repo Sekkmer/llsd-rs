@@ -226,6 +226,64 @@ impl Llsd {
         self.get(index).is_some()
     }
 
+    pub fn get_any<'a>(&'a self, keys: &[&str]) -> Option<&'a Llsd> {
+        let Llsd::Map(map) = self else {
+            return None;
+        };
+        keys.iter().find_map(|key| map.get(*key))
+    }
+
+    pub fn try_coerce_i32(&self) -> Option<i32> {
+        match self {
+            Llsd::Integer(v) => Some(*v),
+            Llsd::Real(v) => Some(*v as i32),
+            Llsd::Boolean(v) => Some(if *v { 1 } else { 0 }),
+            Llsd::String(v) => Some(coerce_string_to_i32(v)),
+            _ => None,
+        }
+    }
+
+    pub fn coerce_i32(&self) -> i32 {
+        self.try_coerce_i32().unwrap_or(0)
+    }
+
+    pub fn try_coerce_f64(&self) -> Option<f64> {
+        match self {
+            Llsd::Real(v) => Some(*v),
+            Llsd::Integer(v) => Some(*v as f64),
+            Llsd::Boolean(v) => Some(if *v { 1.0 } else { 0.0 }),
+            Llsd::String(v) => v.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn coerce_f64(&self) -> f64 {
+        self.try_coerce_f64().unwrap_or(0.0)
+    }
+
+    pub fn try_coerce_bool(&self) -> Option<bool> {
+        match self {
+            Llsd::Boolean(v) => Some(*v),
+            Llsd::Integer(v) => Some(*v != 0),
+            Llsd::Real(v) => Some(*v != 0.0),
+            Llsd::String(v) => Some(!v.is_empty()),
+            _ => None,
+        }
+    }
+
+    pub fn coerce_bool(&self) -> bool {
+        self.try_coerce_bool().unwrap_or(false)
+    }
+
+    pub fn try_coerce_uuid(&self) -> Option<Uuid> {
+        match self {
+            Llsd::Uuid(v) => Some(*v),
+            Llsd::String(v) => Uuid::parse_str(v.trim()).ok(),
+            Llsd::Binary(v) => Uuid::from_slice(v).ok(),
+            _ => None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Llsd::Array(a) => a.len(),
@@ -706,28 +764,6 @@ impl TryFrom<&Llsd> for String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Llsd;
-
-    #[test]
-    fn string_to_integer_try_from_coerces_like_viewer() {
-        assert_eq!(i32::try_from(&Llsd::String("1.23".to_string())).unwrap(), 1);
-        assert_eq!(
-            i32::try_from(&Llsd::String("4294967296".to_string())).unwrap(),
-            0
-        );
-        assert_eq!(
-            u32::try_from(&Llsd::String("-1".to_string())).unwrap(),
-            u32::MAX
-        );
-        assert_eq!(
-            i32::try_from(&Llsd::String("not-a-number".to_string())).unwrap(),
-            0
-        );
-    }
-}
-
 impl<T> TryFrom<&Llsd> for Vec<T>
 where
     T: for<'a> TryFrom<&'a Llsd, Error = anyhow::Error>,
@@ -757,5 +793,69 @@ where
         } else {
             Err(anyhow::Error::msg("Expected LLSD Map"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::Llsd;
+    use uuid::Uuid;
+
+    #[test]
+    fn string_to_integer_try_from_coerces_like_viewer() {
+        assert_eq!(i32::try_from(&Llsd::String("1.23".to_string())).unwrap(), 1);
+        assert_eq!(
+            i32::try_from(&Llsd::String("4294967296".to_string())).unwrap(),
+            0
+        );
+        assert_eq!(
+            u32::try_from(&Llsd::String("-1".to_string())).unwrap(),
+            u32::MAX
+        );
+        assert_eq!(
+            i32::try_from(&Llsd::String("not-a-number".to_string())).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn get_any_picks_first_present_key() {
+        let mut map = HashMap::new();
+        map.insert("legacy".to_string(), Llsd::Integer(7));
+        map.insert("new".to_string(), Llsd::Integer(42));
+        let llsd = Llsd::Map(map);
+
+        assert_eq!(
+            llsd.get_any(&["missing", "new", "legacy"])
+                .map(Llsd::coerce_i32),
+            Some(42)
+        );
+        assert!(llsd.get_any(&["none"]).is_none());
+        assert!(Llsd::Integer(1).get_any(&["new"]).is_none());
+    }
+
+    #[test]
+    fn coerce_helpers_cover_common_shapes() {
+        assert_eq!(Llsd::String("4294967296".to_string()).coerce_i32(), 0);
+        assert_eq!(Llsd::String("1.5".to_string()).coerce_i32(), 1);
+        assert!(!Llsd::String("".to_string()).coerce_bool());
+        assert!(Llsd::String("0".to_string()).coerce_bool());
+        assert!(!Llsd::Integer(0).coerce_bool());
+        assert!(Llsd::Integer(1).coerce_bool());
+        assert_eq!(Llsd::String("1.25".to_string()).coerce_f64(), 1.25);
+    }
+
+    #[test]
+    fn uuid_coercion_supports_uuid_string_and_binary() {
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
+        assert_eq!(Llsd::Uuid(id).try_coerce_uuid(), Some(id));
+        assert_eq!(Llsd::String(id.to_string()).try_coerce_uuid(), Some(id));
+        assert_eq!(
+            Llsd::Binary(id.as_bytes().to_vec()).try_coerce_uuid(),
+            Some(id)
+        );
+        assert!(Llsd::Binary(vec![1, 2, 3]).try_coerce_uuid().is_none());
     }
 }

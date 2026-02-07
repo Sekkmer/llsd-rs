@@ -103,7 +103,7 @@ fn detect_header_token(data: &[u8]) -> Option<String> {
     }
 }
 
-fn payload_after_header<'a>(data: &'a [u8], format: LlsdEncoding) -> &'a [u8] {
+fn payload_after_header(data: &[u8], format: LlsdEncoding) -> &[u8] {
     if starts_with_ignore_ascii_case(data, LEGACY_NON_HEADER) {
         return data;
     }
