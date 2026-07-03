@@ -5,6 +5,10 @@ use uuid::Uuid;
 
 use crate::{Llsd, Uri};
 
+const DEFAULT_MAX_DEPTH: usize = 64;
+const MAX_UNBOUNDED_LENGTH: usize = 64 * 1024 * 1024;
+const MAX_UNBOUNDED_CONTAINER_ENTRIES: usize = 1_000_000;
+
 fn write_inner<W: Write>(llsd: &Llsd, w: &mut W) -> Result<(), anyhow::Error> {
     match llsd {
         Llsd::Undefined => w.write_all(b"!")?,
@@ -77,21 +81,113 @@ pub fn to_vec(llsd: &Llsd) -> Result<Vec<u8>, anyhow::Error> {
     Ok(buf)
 }
 
-macro_rules! read_be_fn {
-    ($func_name:ident, $type:ty) => {
-        fn $func_name<R: Read>(reader: &mut R) -> Result<$type, anyhow::Error> {
-            let mut buf = [0_u8; std::mem::size_of::<$type>()];
-            reader.read_exact(&mut buf)?;
-            Ok(<$type>::from_be_bytes(buf))
-        }
-    };
+struct BinaryReader<'a, R: Read> {
+    reader: &'a mut R,
+    remaining: Option<usize>,
 }
 
-read_be_fn!(read_u8, u8);
-read_be_fn!(read_i32_be, i32);
-read_be_fn!(read_f64_be, f64);
+impl<'a, R: Read> BinaryReader<'a, R> {
+    fn new(reader: &'a mut R, remaining: Option<usize>) -> Self {
+        Self { reader, remaining }
+    }
 
-fn hex<R: Read>(r: &mut R) -> Result<u8, anyhow::Error> {
+    fn remaining(&self) -> Option<usize> {
+        self.remaining
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), anyhow::Error> {
+        if let Some(remaining) = self.remaining
+            && buf.len() > remaining
+        {
+            return Err(anyhow::anyhow!(
+                "LLSD binary length {} exceeds remaining input {}",
+                buf.len(),
+                remaining
+            ));
+        }
+        self.reader.read_exact(buf)?;
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= buf.len();
+        }
+        Ok(())
+    }
+
+    fn read_optional_u8(&mut self) -> Result<Option<u8>, anyhow::Error> {
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+        let mut buf = [0_u8; 1];
+        match self.reader.read(&mut buf) {
+            Ok(0) => Ok(None),
+            Ok(1) => {
+                if let Some(remaining) = &mut self.remaining {
+                    *remaining -= 1;
+                }
+                Ok(Some(buf[0]))
+            }
+            Ok(_) => unreachable!(),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+fn read_u8<R: Read>(reader: &mut BinaryReader<'_, R>) -> Result<u8, anyhow::Error> {
+    let mut buf = [0_u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+fn read_i32_be<R: Read>(reader: &mut BinaryReader<'_, R>) -> Result<i32, anyhow::Error> {
+    let mut buf = [0_u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(i32::from_be_bytes(buf))
+}
+
+fn read_f64_be<R: Read>(reader: &mut BinaryReader<'_, R>) -> Result<f64, anyhow::Error> {
+    let mut buf = [0_u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(f64::from_be_bytes(buf))
+}
+
+fn read_len<R: Read>(
+    reader: &mut BinaryReader<'_, R>,
+    context: &'static str,
+) -> Result<usize, anyhow::Error> {
+    let len = read_i32_be(reader)?;
+    if len < 0 {
+        return Err(anyhow::anyhow!(
+            "Negative LLSD binary {context} length: {len}"
+        ));
+    }
+    let len = len as usize;
+    if let Some(remaining) = reader.remaining() {
+        if len > remaining {
+            return Err(anyhow::anyhow!(
+                "LLSD binary {context} length {len} exceeds remaining input {remaining}"
+            ));
+        }
+    } else if len > MAX_UNBOUNDED_LENGTH {
+        return Err(anyhow::anyhow!(
+            "LLSD binary {context} length {len} exceeds max {MAX_UNBOUNDED_LENGTH}"
+        ));
+    }
+    Ok(len)
+}
+
+fn read_container_len<R: Read>(
+    reader: &mut BinaryReader<'_, R>,
+    context: &'static str,
+) -> Result<usize, anyhow::Error> {
+    let len = read_len(reader, context)?;
+    if reader.remaining().is_none() && len > MAX_UNBOUNDED_CONTAINER_ENTRIES {
+        return Err(anyhow::anyhow!(
+            "LLSD binary {context} entry count {len} exceeds max {MAX_UNBOUNDED_CONTAINER_ENTRIES}"
+        ));
+    }
+    Ok(len)
+}
+
+fn hex<R: Read>(r: &mut BinaryReader<'_, R>) -> Result<u8, anyhow::Error> {
     let c = read_u8(r)?;
     match c {
         b'0'..=b'9' => Ok(c - b'0'),
@@ -101,7 +197,7 @@ fn hex<R: Read>(r: &mut R) -> Result<u8, anyhow::Error> {
     }
 }
 
-fn unescape<R: Read>(r: &mut R, delim: u8) -> Result<String, anyhow::Error> {
+fn unescape<R: Read>(r: &mut BinaryReader<'_, R>, delim: u8) -> Result<String, anyhow::Error> {
     let mut buf = Vec::new();
     loop {
         match read_u8(r)? {
@@ -126,7 +222,16 @@ fn unescape<R: Read>(r: &mut R, delim: u8) -> Result<String, anyhow::Error> {
     Ok(String::from_utf8(buf)?)
 }
 
-fn from_reader_inner_with_tag<R: Read>(r: &mut R, tag: u8) -> Result<Llsd, anyhow::Error> {
+fn from_reader_inner_with_tag<R: Read>(
+    r: &mut BinaryReader<'_, R>,
+    tag: u8,
+    depth_remaining: usize,
+) -> Result<Llsd, anyhow::Error> {
+    if depth_remaining == 0 {
+        return Err(anyhow::anyhow!(
+            "LLSD binary maximum recursion depth exceeded"
+        ));
+    }
     match tag {
         b'!' => Ok(Llsd::Undefined),
         b'1' => Ok(Llsd::Boolean(true)),
@@ -134,13 +239,13 @@ fn from_reader_inner_with_tag<R: Read>(r: &mut R, tag: u8) -> Result<Llsd, anyho
         b'i' => Ok(Llsd::Integer(read_i32_be(r)?)),
         b'r' => Ok(Llsd::Real(read_f64_be(r)?)),
         b's' => {
-            let len = read_i32_be(r)? as usize;
+            let len = read_len(r, "string")?;
             let mut buf = vec![0; len];
             r.read_exact(&mut buf)?;
             Ok(Llsd::String(String::from_utf8(buf)?))
         }
         b'l' => {
-            let len = read_i32_be(r)? as usize;
+            let len = read_len(r, "uri")?;
             let mut buf = vec![0; len];
             r.read_exact(&mut buf)?;
             Ok(Llsd::Uri(Uri::parse(std::str::from_utf8(&buf)?)))
@@ -162,16 +267,16 @@ fn from_reader_inner_with_tag<R: Read>(r: &mut R, tag: u8) -> Result<Llsd, anyho
             Ok(Llsd::Date(date.unwrap_or_default()))
         }
         b'b' => {
-            let len = read_i32_be(r)? as usize;
+            let len = read_len(r, "binary")?;
             let mut buf = vec![0; len];
             r.read_exact(&mut buf)?;
             Ok(Llsd::Binary(buf))
         }
         b'[' => {
-            let len = read_i32_be(r)? as usize;
+            let len = read_container_len(r, "array")?;
             let mut buf = Vec::with_capacity(len);
             for _ in 0..len {
-                buf.push(from_reader_inner(r)?);
+                buf.push(read_inner(r, depth_remaining - 1)?);
             }
             if read_u8(r)? != b']' {
                 return Err(anyhow::anyhow!("Expected ']'"));
@@ -179,17 +284,17 @@ fn from_reader_inner_with_tag<R: Read>(r: &mut R, tag: u8) -> Result<Llsd, anyho
             Ok(Llsd::Array(buf))
         }
         b'{' => {
-            let len = read_i32_be(r)? as usize;
+            let len = read_container_len(r, "map")?;
             let mut buf = std::collections::HashMap::with_capacity(len);
             for _ in 0..len {
                 if read_u8(r)? != b'k' {
                     return Err(anyhow::anyhow!("Expected 'k'"));
                 }
-                let key_len = read_i32_be(r)? as usize;
+                let key_len = read_len(r, "map key")?;
                 let mut key_buf = vec![0; key_len];
                 r.read_exact(&mut key_buf)?;
                 let key = String::from_utf8(key_buf)?;
-                let value = from_reader_inner(r)?;
+                let value = read_inner(r, depth_remaining - 1)?;
                 buf.insert(key, value);
             }
             if read_u8(r)? != b'}' {
@@ -203,9 +308,17 @@ fn from_reader_inner_with_tag<R: Read>(r: &mut R, tag: u8) -> Result<Llsd, anyho
     }
 }
 
-pub fn from_reader_inner<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
+fn read_inner<R: Read>(
+    r: &mut BinaryReader<'_, R>,
+    depth_remaining: usize,
+) -> Result<Llsd, anyhow::Error> {
     let tag = read_u8(r)?;
-    from_reader_inner_with_tag(r, tag)
+    from_reader_inner_with_tag(r, tag, depth_remaining)
+}
+
+pub fn from_reader_inner<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
+    let mut reader = BinaryReader::new(r, None);
+    read_inner(&mut reader, DEFAULT_MAX_DEPTH)
 }
 
 fn looks_like_llsd_binary_header(header: &[u8]) -> bool {
@@ -215,11 +328,14 @@ fn looks_like_llsd_binary_header(header: &[u8]) -> bool {
         .any(|w| w.eq_ignore_ascii_case(NEEDLE))
 }
 
-pub fn from_reader<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
+fn from_binary_reader<R: Read>(
+    r: &mut BinaryReader<'_, R>,
+    max_depth: usize,
+) -> Result<Llsd, anyhow::Error> {
     let mut first = [0u8; 1];
     r.read_exact(&mut first)?;
     if first[0] != b'<' {
-        return from_reader_inner_with_tag(r, first[0]);
+        return from_reader_inner_with_tag(r, first[0], max_depth);
     }
 
     let mut header = vec![first[0]];
@@ -240,23 +356,35 @@ pub fn from_reader<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
 
     // consume optional whitespace after header, then parse next tag
     loop {
-        let mut next = [0u8; 1];
-        match r.read(&mut next) {
-            Ok(0) => return Err(anyhow::anyhow!("Unexpected EOF after LLSD header")),
-            Ok(1) => {
-                if matches!(next[0], b' ' | b'\r' | b'\n' | b'\t') {
-                    continue;
-                }
-                return from_reader_inner_with_tag(r, next[0]);
+        match r.read_optional_u8()? {
+            Some(b' ' | b'\r' | b'\n' | b'\t') => continue,
+            Some(next) => {
+                return from_reader_inner_with_tag(r, next, max_depth);
             }
-            Ok(_) => unreachable!(),
-            Err(err) => return Err(err.into()),
+            None => {
+                return Err(anyhow::anyhow!("Unexpected EOF after LLSD header"));
+            }
         }
     }
 }
 
+pub fn from_reader_with_depth<R: Read>(r: &mut R, max_depth: usize) -> Result<Llsd, anyhow::Error> {
+    let mut reader = BinaryReader::new(r, None);
+    from_binary_reader(&mut reader, max_depth)
+}
+
+pub fn from_reader<R: Read>(r: &mut R) -> Result<Llsd, anyhow::Error> {
+    from_reader_with_depth(r, DEFAULT_MAX_DEPTH)
+}
+
+pub fn from_slice_with_depth(data: &[u8], max_depth: usize) -> Result<Llsd, anyhow::Error> {
+    let mut cursor = std::io::Cursor::new(data);
+    let mut reader = BinaryReader::new(&mut cursor, Some(data.len()));
+    from_binary_reader(&mut reader, max_depth)
+}
+
 pub fn from_slice(data: &[u8]) -> Result<Llsd, anyhow::Error> {
-    from_reader(&mut std::io::Cursor::new(data))
+    from_slice_with_depth(data, DEFAULT_MAX_DEPTH)
 }
 
 #[cfg(test)]
@@ -361,6 +489,63 @@ mod tests {
 
         let decoded = from_slice(&encoded).expect("decode failed");
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn negative_string_length_is_rejected_without_panic() {
+        let err = std::panic::catch_unwind(|| from_slice(b"s\xff\xff\xff\xff"))
+            .expect("decode must not panic")
+            .expect_err("negative length should fail");
+        assert!(
+            err.to_string()
+                .contains("Negative LLSD binary string length")
+        );
+    }
+
+    #[test]
+    fn length_larger_than_remaining_input_is_rejected_before_allocation() {
+        let err = std::panic::catch_unwind(|| from_slice(b"s\x00\x00\x00\x08hi"))
+            .expect("decode must not panic")
+            .expect_err("overlong string should fail");
+        assert!(err.to_string().contains("exceeds remaining input"));
+    }
+
+    #[test]
+    fn negative_map_key_length_is_rejected_without_panic() {
+        let err = std::panic::catch_unwind(|| from_slice(b"{\x00\x00\x00\x01k\xff\xff\xff\xff}"))
+            .expect("decode must not panic")
+            .expect_err("negative map-key length should fail");
+        assert!(
+            err.to_string()
+                .contains("Negative LLSD binary map key length")
+        );
+    }
+
+    #[test]
+    fn nested_containers_are_depth_limited() {
+        let mut encoded = Vec::new();
+        for _ in 0..65 {
+            encoded.push(b'[');
+            encoded.extend_from_slice(&1_i32.to_be_bytes());
+        }
+        encoded.push(b'!');
+        encoded.extend(std::iter::repeat_n(b']', 65));
+
+        let err = from_slice_with_depth(&encoded, 64).expect_err("depth limit should fail");
+        assert!(err.to_string().contains("maximum recursion depth"));
+
+        let decoded = from_slice_with_depth(&encoded, 66).expect("larger depth should decode");
+        let mut current = &decoded;
+        for _ in 0..65 {
+            match current {
+                Llsd::Array(values) => {
+                    assert_eq!(values.len(), 1);
+                    current = &values[0];
+                }
+                other => panic!("expected nested array, got {other:?}"),
+            }
+        }
+        assert_eq!(*current, Llsd::Undefined);
     }
 
     #[test]

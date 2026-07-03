@@ -60,7 +60,7 @@ pub fn from_slice_with(data: &[u8], options: AutoDecodeOptions) -> Result<Llsd, 
     let format = detect_format(data);
     let payload = payload_after_header(data, format);
     match format {
-        LlsdEncoding::Binary => binary::from_slice(payload),
+        LlsdEncoding::Binary => binary::from_slice_with_depth(payload, options.notation_max_depth),
         LlsdEncoding::Xml => xml::from_slice(payload),
         LlsdEncoding::Notation => notation::from_bytes(payload, options.notation_max_depth)
             .map_err(|err| anyhow::anyhow!("Notation parse error: {err}")),
